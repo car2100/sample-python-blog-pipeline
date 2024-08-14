@@ -1,0 +1,72 @@
+trigger: none
+
+name: Terraform-Destroy
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - ${{ if eq(variables['Build.SourceBranchName'], 'master') }}:
+    - group: function-production
+  - ${{ else }}:
+    - group: function-development
+
+jobs:
+- ${{ if eq(variables['Build.SourceBranchName'], 'master') }}:
+  - job: Manual_Intervention
+    displayName: 'Manual Intervention'
+    pool: server
+    steps:
+    - task: ManualValidation@0
+      timeoutInMinutes: 60
+      inputs:
+        notifyUsers: c.botelho@teltecsolutions.com.br
+        onTimeout: 'reject'
+- job: Destroy
+  displayName: 'Destroy Infrastructure'
+  ${{ if eq(variables['Build.SourceBranchName'], 'master') }}:
+    dependsOn: Manual_Intervention
+  pool:
+    vmImage: ubuntu-latest
+  steps:
+  - bash: |
+      export branch_name=$(echo $(Build.SourceBranchName) | sed 's/[.]/-/g')
+      echo $branch_name
+      echo "##vso[task.setvariable variable=ResourceBranchName]$branch_name"
+      export app_name_sa=$(echo $(APP_NAME) | sed 's/[-]//g')
+      echo "##vso[task.setvariable variable=AppNameSA]$app_name_sa"
+  - bash: echo $(ResourceBranchName)
+  - task: TerraformTaskV2@2
+    displayName: 'Terraform : Init'
+    inputs:
+      backendServiceArm: $(SONAR_SERVICE_CONNECTION)
+      backendAzureRmResourceGroupName: $(RG_BACKEND)
+      backendAzureRmStorageAccountName: $(SA_NAME)
+      backendAzureRmContainerName: $(BLOB_NAME)
+      backendAzureRmKey: 'terraform.tfstate'
+      workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+  - task: TerraformTaskV2@2
+    displayName: 'Terraform : Validate'
+    inputs:
+      command: validate
+      workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+  - task: TerraformTaskV3@3
+    displayName: 'Terraform workspace'
+    inputs:
+      command: custom
+      commandOptions: 'workspace select -or-create $(Build.SourceBranchName)'
+      environmentServiceNameAzureRM: $(SONAR_SERVICE_CONNECTION)
+      workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+
+  - task: TerraformTaskV2@2
+    displayName: 'Terraform : Destroy'
+    inputs:
+      backendServiceArm: $(SONAR_SERVICE_CONNECTION)
+      backendAzureRmResourceGroupName: $(RG_BACKEND)
+      backendAzureRmStorageAccountName: $(SA_NAME)
+      backendAzureRmContainerName: $(BLOB_NAME)
+      backendAzureRmKey: 'terraform.tfstate'
+      command: destroy
+      environmentServiceNameAzureRM: $(SONAR_SERVICE_CONNECTION)
+      workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+      commandOptions: '-input=false -auto-approve -var "app_name_sa=$(AppNameSA)" -var "subscription_id=$(SUBSCRIPTION_ID)" -var "branch=$(ResourceBranchName)" -var "environment=$(ENVIRONMENT)" -var "sku_name=$(SKU_ASP)" -var "container_name=$(CONTAINER_NAME)" -var "client_id=$(CLIENT_ID)" -var "access_key=$(STO_ACCESS_KEY)" -var "storage_account_name=$(STO_NAME)" -var "resource_group_name=$(RG_NAME)" -var "location=$(LOCATION)" -var "app_name=$(APP_NAME)" -var "acr_url=$(ACR_URL)" -var "acr_username=$(ACR_USERNAME)" -var "storage_account_string=$(STO_CONNECTION_STRING)" -var "acr_password=$(ACR_PASSWORD)" -var "image_name=$(IMAGE_NAME)" -var "image_tag=$(Build.BuildId)"'

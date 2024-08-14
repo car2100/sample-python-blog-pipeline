@@ -1,0 +1,175 @@
+trigger:
+  branches:
+    include:
+    - '*'
+  paths:
+    include:
+      - flaskr/*
+      - tests/*
+
+name: Test-Build-Deploy
+  
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - ${{ if eq(variables['Build.SourceBranchName'], 'master') }}:
+    - group: function-production
+  - ${{ else }}:
+    - group: function-development
+
+jobs:
+
+- ${{ if eq(variables['Build.SourceBranchName'], 'master') }}:
+  - job: Manual_Intervention
+    displayName: 'Manual Intervention'
+    pool: server
+    steps:
+    - task: ManualValidation@0
+      timeoutInMinutes: 60
+      inputs:
+        notifyUsers: c.botelho@teltecsolutions.com.br
+        onTimeout: 'reject'
+
+- job: Unit_Test
+  ${{ if eq(variables['Build.SourceBranchName'], 'master') }}:
+    dependsOn: Manual_Intervention
+  displayName: System Test
+  pool:
+    vmImage: ubuntu-latest
+  steps:
+  - script: |
+      pip install --editable .
+      pip install pytest pytest-cov coverage coverage2clover
+      pytest --cov-report xml:$(Build.Repository.Name)/coverage.xml --cov-config=setup.cfg --cov=flaskr/ -vv
+    displayName: 'Install dependencies and run tests'
+  - task: PublishBuildArtifacts@1
+    inputs:
+      pathToPublish: $(Build.Repository.Name)/coverage.xml
+      artifactName: coveragesummary
+
+- job: Code_Analisys
+  displayName: Code Analysis
+  dependsOn: Unit_Test
+  pool:
+    vmImage: ubuntu-latest
+  steps:
+  - task: DownloadBuildArtifacts@0
+    inputs:
+      buildType: 'current'
+      downloadType: 'single'
+      artifactName: 'coveragesummary'
+      downloadPath: '$(System.ArtifactsDirectory)'
+  - script: cat $(System.ArtifactsDirectory)/coveragesummary/coverage.xml
+  - task: SonarQubePrepare@6
+    inputs:
+      SonarQube: sonarqube
+      scannerMode: 'CLI'
+      configMode: 'manual'
+      cliProjectKey: $(SONAR_PROJECT_KEY)
+      extraProperties: |
+        sonar.python.coverage.reportPaths=$(System.ArtifactsDirectory)/coveragesummary/coverage.xml
+        sonar.exclusions=**/tests/**,**/test_*.py,**/conftest.py, **/setup.py, **/terraform/**
+        sonar.verbose=true
+  - task: SonarQubeAnalyze@6
+    inputs:
+      jdkversion: 'JAVA_HOME_17_X64'
+
+- job: Build_Application
+  displayName: Build Application
+  dependsOn: Code_Analisys
+  pool:
+    vmImage: ubuntu-latest
+  steps:
+  - checkout: self
+  - script: |
+      docker build --build-arg FLASK_ENV="$(ENVIRONMENT)" -t $(IMAGE_NAME) .
+    displayName: Build
+  - script: |
+      docker login -u $(ACR_USERNAME) -p $(ACR_PASSWORD) $(ACR_URL)
+      docker tag $(IMAGE_NAME) $(ACR_URL)/$(IMAGE_NAME):$(Build.BuildId)
+      docker push $(ACR_URL)/$(IMAGE_NAME):$(Build.BuildId)
+    displayName: Push Image
+
+- job: Validate_Infrastructure
+  displayName: Terraform Validate
+  dependsOn: Code_Analisys
+  pool:
+    vmImage: ubuntu-latest
+  steps:
+  - checkout: self
+  - task: TerraformInstaller@0
+    displayName: Install Terraform latest
+  - task: TerraformTaskV2@2
+    displayName: 'Terraform : Init'
+    inputs:
+      backendServiceArm: $(SONAR_SERVICE_CONNECTION)
+      backendAzureRmResourceGroupName: $(RG_BACKEND)
+      backendAzureRmStorageAccountName: $(SA_NAME)
+      backendAzureRmContainerName: $(BLOB_NAME)
+      backendAzureRmKey: 'terraform.tfstate'
+      workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+  - task: TerraformTaskV2@2
+    displayName: 'Terraform : Validate'
+    inputs:
+      command: validate
+
+- job: Deploy_Infrastructure
+  displayName: Terraform Deploy
+  dependsOn:
+    - Validate_Infrastructure
+    - Build_Application
+  pool:
+    vmImage: ubuntu-latest
+  steps:
+  - checkout: self
+  - task: TerraformInstaller@0
+    displayName: Install Terraform latest
+  - bash: |
+      export branch_name=$(echo $(Build.SourceBranchName) | sed 's/[.]/-/g')
+      echo $branch_name
+      echo "##vso[task.setvariable variable=ResourceBranchName]$branch_name"
+      export app_name_sa=$(echo $(APP_NAME) | sed 's/[-]//g')
+      echo "##vso[task.setvariable variable=AppNameSA]$app_name_sa"
+    displayName: "Manipulate Branch Name"
+  - bash: echo $(ResourceBranchName)
+    displayName: "Print Manipulated Branch Name"
+  - task: TerraformTaskV2@2
+    displayName: 'Terraform : Init'
+    inputs:
+      backendServiceArm: $(SONAR_SERVICE_CONNECTION)
+      backendAzureRmResourceGroupName: $(RG_BACKEND)
+      backendAzureRmStorageAccountName: $(SA_NAME)
+      backendAzureRmContainerName: $(BLOB_NAME)
+      backendAzureRmKey: 'terraform.tfstate'
+      workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+  - task: TerraformTaskV3@3
+    displayName: 'Terraform workspace'
+    inputs:
+      command: custom
+      commandOptions: 'workspace select -or-create $(Build.SourceBranchName)'
+      environmentServiceNameAzureRM: $(SONAR_SERVICE_CONNECTION)
+      workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+  - task: TerraformTaskV2@2
+    displayName: 'Terraform : Plan'
+    inputs:
+      command: plan
+      environmentServiceNameAzureRM: $(SONAR_SERVICE_CONNECTION)
+      backendAzureRmResourceGroupName: $(RG_BACKEND)
+      backendAzureRmStorageAccountName: $(SA_NAME)
+      backendAzureRmContainerName: $(BLOB_NAME)
+      backendAzureRmKey: 'terraform.tfstate'
+      workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+      commandOptions: '-input=false -var "app_name_sa=$(AppNameSA)" -var "subscription_id=$(SUBSCRIPTION_ID)" -var "branch=$(ResourceBranchName)" -var "environment=$(ENVIRONMENT)" -var "sku_name=$(SKU_ASP)" -var "container_name=$(CONTAINER_NAME)" -var "client_id=$(CLIENT_ID)" -var "access_key=$(STO_ACCESS_KEY)" -var "storage_account_name=$(STO_NAME)" -var "resource_group_name=$(RG_NAME)" -var "location=$(LOCATION)" -var "app_name=$(APP_NAME)" -var "acr_url=$(ACR_URL)" -var "acr_username=$(ACR_USERNAME)" -var "storage_account_string=$(STO_CONNECTION_STRING)" -var "acr_password=$(ACR_PASSWORD)" -var "image_name=$(IMAGE_NAME)" -var "image_tag=$(Build.BuildId)"'
+  - task: TerraformTaskV2@2
+    displayName: 'Terraform : Validate and Apply'
+    inputs:
+      backendServiceArm: $(SONAR_SERVICE_CONNECTION)
+      backendAzureRmResourceGroupName: $(RG_BACKEND)
+      backendAzureRmStorageAccountName: $(SA_NAME)
+      backendAzureRmContainerName: $(BLOB_NAME)
+      backendAzureRmKey: 'terraform.tfstate'
+      command: apply
+      environmentServiceNameAzureRM: $(SONAR_SERVICE_CONNECTION)
+      workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+      commandOptions: '-input=false -auto-approve -var "app_name_sa=$(AppNameSA)" -var "subscription_id=$(SUBSCRIPTION_ID)" -var "branch=$(ResourceBranchName)" -var "environment=$(ENVIRONMENT)" -var "sku_name=$(SKU_ASP)" -var "container_name=$(CONTAINER_NAME)" -var "client_id=$(CLIENT_ID)" -var "access_key=$(STO_ACCESS_KEY)" -var "storage_account_name=$(STO_NAME)" -var "resource_group_name=$(RG_NAME)" -var "location=$(LOCATION)" -var "app_name=$(APP_NAME)" -var "acr_url=$(ACR_URL)" -var "acr_username=$(ACR_USERNAME)" -var "storage_account_string=$(STO_CONNECTION_STRING)" -var "acr_password=$(ACR_PASSWORD)" -var "image_name=$(IMAGE_NAME)" -var "image_tag=$(Build.BuildId)"'
