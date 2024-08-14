@@ -1,6 +1,6 @@
 Application original source code from https://github.com/pallets/flask/tree/master/examples/tutorial<br/>
 <br/><br/>
-VARIABLES:<br/>
+**VARIABLES**:<br/>
 ACR_PASSWORD = Container Registry password.<br/>
 ACR_URL = Container Registry URL.<br/>
 ACR_USERNAME = Container Registry Username.<br/>
